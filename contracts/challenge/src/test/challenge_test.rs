@@ -524,3 +524,75 @@ fn settle_handles_participant_with_no_deposits() {
     
     assert_eq!(c.balance(&c.client.address), 0);
 }
+
+#[test]
+fn growth_rate_with_zero_first_deposit_handled_correctly() {
+    let c = setup();
+    // Target 5000 basis points = 50% growth
+    let id = c.create(&c.config(ChallengeKind::GrowthRate, 5_000));
+    let participant = c.joined(id, 10_000);
+    
+    // Making deposits in a valid sequence
+    c.client.deposit(&participant, &id, &2_000);
+    c.client.deposit(&participant, &id, &1_000);
+    
+    let p = c.client.get_participant(&id, &participant);
+    assert_eq!(p.first_deposit, 2_000);
+    assert_eq!(p.saved, 3_000);
+    
+    // Growth is 1000/2000 = 50%, which meets the 50% target
+    assert!(c.client.is_on_track(&id, &participant));
+    
+    c.end(id);
+    let payout = c.client.settle(&id, &participant);
+    // Only participant, so gets full stake back plus all deposits
+    assert_eq!(payout, STAKE + 3_000);
+    assert_eq!(c.client.get_challenge(&id).winners, 1);
+}
+
+#[test]
+fn multiple_deposits_in_same_period_count_as_one_for_consistency() {
+    let c = setup();
+    // Target: be active in at least 4 periods
+    let id = c.create(&c.config(ChallengeKind::Consistency, 4));
+    let alice = c.joined(id, 10_000);
+    let bob = c.joined(id, 10_000);
+    
+    // Alice makes multiple deposits in same period - should count as 1
+    c.client.deposit(&alice, &id, &100);
+    c.client.deposit(&alice, &id, &100);
+    c.client.deposit(&alice, &id, &100);
+    assert_eq!(c.client.get_participant(&id, &alice).active_periods, 1);
+    assert_eq!(c.client.get_participant(&id, &alice).deposits, 3);
+    
+    // Move to different periods
+    c.advance(DAY);
+    c.client.deposit(&alice, &id, &100);
+    c.client.deposit(&bob, &id, &100);
+    
+    c.advance(DAY);
+    c.client.deposit(&alice, &id, &100);
+    c.client.deposit(&bob, &id, &100);
+    
+    c.advance(DAY);
+    c.client.deposit(&alice, &id, &100);
+    c.client.deposit(&bob, &id, &100);
+    
+    // Alice: 4 periods, Bob: 3 periods
+    assert_eq!(c.client.get_participant(&id, &alice).active_periods, 4);
+    assert_eq!(c.client.get_participant(&id, &bob).active_periods, 3);
+    assert!(c.client.is_on_track(&id, &alice));
+    assert!(!c.client.is_on_track(&id, &bob));
+    
+    c.end(id);
+    
+    // Bob loses penalty, Alice wins
+    let bob_payout = c.client.settle(&id, &bob);
+    assert_eq!(bob_payout, STAKE - 200 + 300); // penalty + deposits back
+    
+    let alice_payout = c.client.settle(&id, &alice);
+    assert_eq!(alice_payout, STAKE + 600 + 200); // stake + deposits + bonus
+    
+    assert_eq!(c.balance(&c.client.address), 0);
+    assert_eq!(c.client.get_challenge(&id).winners, 1);
+}
