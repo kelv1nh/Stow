@@ -5604,3 +5604,338 @@ fn partial_liquidate_emits_event() {
         (plan_id, owner, 20_000_000, 1_000_000, 20_000_000, now + 1)
     );
 }
+
+// ---------------------------------------------------------------------------
+// Additional comprehensive tests for edge cases and advanced scenarios
+// ---------------------------------------------------------------------------
+
+/// Test that multiple goals can be created and managed independently by the
+/// same owner, ensuring state isolation between different savings goals.
+#[test]
+fn multiple_goals_per_owner_maintain_independent_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const TOTAL_FUNDS: i128 = 300_000_000;
+    mint(&env, &token, &token_admin, &owner, TOTAL_FUNDS);
+
+    // Create three distinct goals with different targets
+    let goal_1 = client.goal_create(&owner, &String::from_str(&env, "vacation"), &100_000_000);
+    let goal_2 = client.goal_create(&owner, &String::from_str(&env, "emergency"), &150_000_000);
+    let goal_3 = client.goal_create(&owner, &String::from_str(&env, "car"), &50_000_000);
+
+    // Contribute to each goal independently
+    client.goal_contribute(&owner, &goal_1, &60_000_000);
+    client.goal_contribute(&owner, &goal_2, &100_000_000);
+    client.goal_contribute(&owner, &goal_3, &50_000_000);
+
+    // Verify each goal maintains its own state
+    let g1 = client.goal(&goal_1);
+    assert_eq!(g1.saved_amount, 60_000_000);
+    assert_eq!(g1.target_amount, 100_000_000);
+    assert!(g1.reached_at.is_none());
+
+    let g2 = client.goal(&goal_2);
+    assert_eq!(g2.saved_amount, 100_000_000);
+    assert_eq!(g2.target_amount, 150_000_000);
+    assert!(g2.reached_at.is_none());
+
+    let g3 = client.goal(&goal_3);
+    assert_eq!(g3.saved_amount, 50_000_000);
+    assert_eq!(g3.target_amount, 50_000_000);
+    assert!(g3.reached_at.is_some(), "goal 3 should be reached");
+
+    // Claim only the reached goal
+    advance_ledger(&env);
+    client.goal_claim(&owner, &goal_3);
+
+    // Verify goal 3 is closed while others remain active
+    assert_eq!(client.try_goal(&goal_3), Err(Ok(Error::NotFound)));
+    assert_eq!(client.goal(&goal_1).saved_amount, 60_000_000);
+    assert_eq!(client.goal(&goal_2).saved_amount, 100_000_000);
+}
+
+/// Test compound interest calculation accuracy over multiple periods with
+/// different frequencies, ensuring no drift or accumulation errors.
+#[test]
+fn compound_interest_accuracy_across_multiple_frequencies() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+
+    // Test monthly compounding accuracy
+    let owner_monthly = setup_interest(
+        &env,
+        &client,
+        &admin,
+        &token,
+        &token_admin,
+        1200, // 12% annual
+        CompoundFrequency::Monthly,
+    );
+
+    // Advance 12 months and verify compound growth
+    set_ledger_time(&env, 12 * MONTH, 2);
+    let accrued_monthly = client.interest_accrued(&owner_monthly);
+    
+    // With 12% annual compounded monthly: (1 + 0.01)^12 ≈ 1.126825
+    // Expected: ~126,825 (12.6825% effective annual rate)
+    assert!(
+        accrued_monthly >= 126_000 && accrued_monthly <= 127_000,
+        "monthly compounding over 12 periods should yield ~126,825, got {}",
+        accrued_monthly
+    );
+
+    // Test annual compounding
+    let owner_annual = setup_interest(
+        &env,
+        &client,
+        &admin,
+        &token,
+        &token_admin,
+        1200,
+        CompoundFrequency::Annually,
+    );
+
+    set_ledger_time(&env, YEAR, 3);
+    let accrued_annual = client.interest_accrued(&owner_annual);
+    
+    // With 12% annual compounded annually: 1.12 - 1 = 0.12
+    // Expected: exactly 120,000 (12%)
+    assert_eq!(
+        accrued_annual, 120_000,
+        "annual compounding should yield exactly 12%"
+    );
+
+    // Verify monthly compounds to more than annual (time value of money)
+    assert!(
+        accrued_monthly > accrued_annual,
+        "monthly compounding should yield more than annual: {} vs {}",
+        accrued_monthly,
+        accrued_annual
+    );
+}
+
+/// Test that reward streaks properly handle boundary conditions including
+/// streak preservation across claims, maximum streak caps, and reset logic.
+#[test]
+fn reward_streak_boundary_conditions_and_caps() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let (owner, _) = setup_rewards(&env, &client, &admin, &token);
+
+    // Build a long streak by consistently pinging
+    for week in 1..=10 {
+        client.reward_ping(&owner);
+        set_ledger_time(&env, WEEK * week, (week + 1) as u32);
+        client.reward_accrue(&owner);
+    }
+
+    let state = client.reward_state(&owner).unwrap();
+    assert_eq!(state.streak, 10, "streak should reach 10 consecutive periods");
+
+    // Verify streak bonus is applied and capped
+    let config = client.reward_config();
+    let expected_bonus = core::cmp::min(
+        10 * config.streak_bonus_bps_per_period,
+        config.streak_bonus_cap_bps,
+    );
+    let actual_bonus = crate::rewards::streak_bonus_bps(state.streak, &config);
+    assert_eq!(
+        actual_bonus, expected_bonus,
+        "streak bonus should be capped at config maximum"
+    );
+
+    // Claim and verify streak persists
+    let pending_before = state.pending;
+    let claimed = client.reward_claim(&owner);
+    assert_eq!(claimed, pending_before);
+    assert_eq!(
+        client.reward_state(&owner).unwrap().streak,
+        10,
+        "claiming should not reset streak"
+    );
+
+    // Continue streak beyond cap
+    for week in 11..=20 {
+        client.reward_ping(&owner);
+        set_ledger_time(&env, WEEK * week, (week + 1) as u32);
+        client.reward_accrue(&owner);
+    }
+
+    let capped_bonus = crate::rewards::streak_bonus_bps(20, &config);
+    assert_eq!(
+        capped_bonus, config.streak_bonus_cap_bps,
+        "extended streak should still be capped"
+    );
+
+    // Break the streak by missing one period
+    set_ledger_time(&env, WEEK * 22, 23);
+    client.reward_accrue(&owner);
+    assert_eq!(
+        client.reward_state(&owner).unwrap().streak,
+        0,
+        "missed period should reset streak to 0"
+    );
+}
+
+/// Test insurance fund operations including premium collection, claim approval
+/// workflow, partial fund depletion, and claim size limits.
+#[test]
+fn insurance_fund_comprehensive_operations() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+
+    // Configure insurance: 2% premium, 10% max claim
+    client.set_insurance_premium_bps(&admin, &200);
+    client.set_insurance_max_claim_bps(&admin, &1_000);
+
+    // Fund initial insurance pool
+    const INITIAL_FUND: i128 = 500_000_000; // 500 USDC
+    mint(&env, &token, &token_admin, &admin, INITIAL_FUND);
+    client.insurance_fund(&admin, &INITIAL_FUND);
+    assert_eq!(client.insurance_fund_balance(), INITIAL_FUND);
+
+    // User deposits trigger premium collection
+    let user1 = Address::generate(&env);
+    const DEPOSIT1: i128 = 100_000_000;
+    mint(&env, &token, &token_admin, &user1, DEPOSIT1);
+    client.deposit(&user1, &DEPOSIT1);
+
+    let expected_premium1 = DEPOSIT1 * 200 / 10_000; // 2 USDC
+    let new_fund_balance = INITIAL_FUND + expected_premium1;
+    assert_eq!(client.insurance_fund_balance(), new_fund_balance);
+
+    // Multiple claims from different users
+    let claimant1 = Address::generate(&env);
+    let claimant2 = Address::generate(&env);
+    let claimant3 = Address::generate(&env);
+
+    const CLAIM1: i128 = 30_000_000;
+    const CLAIM2: i128 = 20_000_000;
+    const CLAIM3: i128 = 15_000_000;
+
+    client.insurance_approve_claim(&admin, &claimant1, &CLAIM1);
+    client.insurance_approve_claim(&admin, &claimant2, &CLAIM2);
+    client.insurance_approve_claim(&admin, &claimant3, &CLAIM3);
+
+    // Redeem claims in different order
+    client.insurance_redeem_claim(&claimant2);
+    client.insurance_redeem_claim(&claimant1);
+
+    let expected_remaining = new_fund_balance - CLAIM1 - CLAIM2;
+    assert_eq!(client.insurance_fund_balance(), expected_remaining);
+
+    // Verify unredeemed claim still exists
+    let claim3 = client.insurance_claim(&claimant3);
+    assert!(!claim3.redeemed);
+    assert_eq!(claim3.amount, CLAIM3);
+
+    // Attempt to claim beyond max_claim_bps (10% of remaining fund)
+    let greedy = Address::generate(&env);
+    let max_allowed = expected_remaining * 1_000 / 10_000;
+    let result = client.try_insurance_approve_claim(&admin, &greedy, &(max_allowed + 1));
+    assert_eq!(result, Err(Ok(Error::DepositCapExceeded)));
+
+    // Approve and redeem maximum allowed claim
+    client.insurance_approve_claim(&admin, &greedy, &max_allowed);
+    client.insurance_redeem_claim(&greedy);
+
+    // Fund can be replenished
+    mint(&env, &token, &token_admin, &admin, 100_000_000);
+    client.insurance_fund(&admin, &100_000_000);
+    assert!(client.insurance_fund_balance() > expected_remaining - max_allowed);
+}
+
+/// Test emergency mode interactions with various vault operations including
+/// pause/unpause sequences, emergency withdrawals, and state transitions.
+#[test]
+fn emergency_mode_comprehensive_state_transitions() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const DEPOSIT: i128 = 100_000_000;
+    const LOCKED: i128 = 50_000_000;
+
+    // Set up initial state: flexible deposit and locked plan
+    mint(&env, &token, &token_admin, &user, DEPOSIT + LOCKED);
+    client.deposit(&user, &DEPOSIT);
+
+    let now: u64 = 1_000_000;
+    set_ledger_time(&env, now, 100);
+    let plan_id = client.locked_create(&user, &LOCKED, &(now + 100_000));
+
+    // Verify normal operations work
+    assert!(!client.is_paused());
+    assert!(!client.is_emergency_mode());
+
+    // Activate pause (not emergency) - blocks all mutations
+    client.pause(&admin);
+    assert!(client.is_paused());
+
+    let deposit_result = client.try_deposit(&user, &1_000_000);
+    assert_eq!(deposit_result, Err(Ok(Error::Paused)));
+
+    let withdraw_result = client.try_withdraw(&user, &1_000_000);
+    assert_eq!(withdraw_result, Err(Ok(Error::Paused)));
+
+    // Emergency withdraw still blocked without emergency mode
+    let emergency_result = client.try_locked_emergency_withdraw(&user, &plan_id);
+    assert_eq!(emergency_result, Err(Ok(Error::NotPaused)));
+
+    // Transition to emergency mode (automatically unpauses)
+    client.unpause(&admin);
+    client.set_emergency_mode(&admin, &true);
+    assert!(!client.is_paused());
+    assert!(client.is_emergency_mode());
+
+    // In emergency mode: deposits blocked, withdrawals allowed, emergency withdrawals enabled
+    let deposit_result = client.try_deposit(&user, &1_000_000);
+    assert_eq!(deposit_result, Err(Ok(Error::EmergencyShutdown)));
+
+    client.withdraw(&user, &10_000_000);
+    assert_eq!(client.get_account(&user).balance, DEPOSIT - 10_000_000);
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let balance_before_emergency = token_client.balance(&user);
+    client.locked_emergency_withdraw(&user, &plan_id);
+    assert_eq!(
+        token_client.balance(&user) - balance_before_emergency,
+        LOCKED
+    );
+    assert_eq!(client.locked_plan(&plan_id).balance, 0);
+
+    // Can transition back to normal
+    client.set_emergency_mode(&admin, &false);
+    assert!(!client.is_emergency_mode());
+
+    // Normal operations resume
+    mint(&env, &token, &token_admin, &user, 1_000_000);
+    client.deposit(&user, &1_000_000);
+
+    // Can activate both pause and emergency simultaneously
+    client.pause(&admin);
+    client.set_emergency_mode(&admin, &true);
+    assert!(client.is_paused());
+    assert!(client.is_emergency_mode());
+
+    // Emergency withdrawal works even when paused
+    let plan_id2 = client.locked_create(&user, &10_000_000, &(now + 100_000));
+    client.locked_emergency_withdraw(&user, &plan_id2);
+    assert_eq!(client.locked_plan(&plan_id2).balance, 0);
+}
